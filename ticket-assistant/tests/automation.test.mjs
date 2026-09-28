@@ -62,7 +62,7 @@ function setup(ids = ['melon']) {
     sessions: new Map(ids.map(id => [id, fixtures[id].session])),
     check: async (id, options) => { checks.push({ id, options }); return { status: 'verified' }; },
   };
-  const runner = new Runner(browsers, () => {}, { elementWaitMs: 20, pollMs: 1, afterClickMs: 0 });
+  const runner = new Runner(browsers, () => {}, { elementWaitMs: 20, pollMs: 1, afterClickMs: 0, openingRefreshMs: 5, openingWaitMs: 1500, openingProbeMs: 20 });
   return { runner, fixtures, checks };
 }
 
@@ -317,12 +317,138 @@ test('미리 선택할 수 없던 회차는 오픈 시각에 공연 페이지만
   const scheduledAt = new Date(at + 9 * 3600000).toISOString().slice(0, 19);
   await runner.start({ ...configFor(), scheduledAt });
   const deadline = Date.now() + 1000;
-  while (runner.state.jobs.melon?.status !== 'waiting' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
+  while (runner.state.jobs.melon?.status !== 'waiting_open' && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 5));
   assert.deepEqual(fixtures.melon.state.clicks, []);
   assert.equal(fixtures.melon.state.loads, 1);
   await runner.task;
   assert.equal(fixtures.melon.state.loads, 2);
   assert.deepEqual(fixtures.melon.state.clicks, ['#date', '#time', '#entry', '#zone', '#seat']);
+});
+
+async function prepareOpening(customize) {
+  const data = setup();
+  const scheduledAt = new Date(Date.now() + 9 * 3600000 + 1800).toISOString().slice(0, 19);
+  const at = Date.parse(scheduledAt + '+09:00');
+  customize(data, at);
+  await data.runner.start({ ...configFor(), scheduledAt });
+  return { ...data, at };
+}
+
+test('오픈이 두 번 늦어도 정각 전 갱신 없이 기다리고 열린 뒤 한 번만 진입한다', async () => {
+  const loadsAt = [];
+  const { runner, fixtures, at } = await prepareOpening(({ runner, fixtures }) => {
+    runner.openingRefreshMs = 60;
+    fixtures.melon.state.missing.add('#date');
+    fixtures.melon.state.onGoto = loads => {
+      loadsAt.push(Date.now());
+      if (loads === 4) fixtures.melon.state.missing.delete('#date');
+    };
+  });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 4);
+  assert.ok(loadsAt.slice(1).every(time => time >= at));
+  assert.ok(loadsAt.slice(2).every((time, index) => time - loadsAt[index + 1] >= 60));
+  assert.deepEqual(fixtures.melon.state.clicks, ['#date', '#time', '#entry', '#zone', '#seat']);
+  assert.equal(runner.state.jobs.melon.status, 'selected');
+});
+
+test('날짜만 미리 선택한 경우 갱신 후 날짜부터 다시 선택한다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ fixtures }) => {
+    fixtures.melon.state.missing.add('#time');
+    fixtures.melon.state.onGoto = loads => { if (loads === 2) fixtures.melon.state.missing.delete('#time'); };
+  });
+  await runner.task;
+  assert.deepEqual(fixtures.melon.state.clicks, ['#date', '#date', '#time', '#entry', '#zone', '#seat']);
+});
+
+test('예약 정각에 화면이 자체 전환되면 새로고침 없이 진행한다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ runner, fixtures }) => {
+    fixtures.melon.state.missing.add('#date');
+    const run = runner.runMelonOpening.bind(runner);
+    runner.runMelonOpening = (...args) => { fixtures.melon.state.missing.delete('#date'); return run(...args); };
+  });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 1);
+  assert.equal(runner.state.jobs.melon.status, 'selected');
+});
+
+test('오픈 재탐색은 횟수 제한 후 이어가기 상태로 멈춘다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ runner, fixtures }) => {
+    runner.openingMaxRefreshes = 2;
+    fixtures.melon.state.missing.add('#date');
+  });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 3);
+  assert.equal(runner.state.status, 'waiting');
+  assert.equal(runner.state.jobs.melon.canResume, true);
+  assert.match(runner.state.jobs.melon.message, /제한/);
+  fixtures.melon.state.missing.delete('#date');
+  await runner.resume('melon', { runId: runner.state.runId, phase: 'date' });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 3);
+  assert.equal(runner.state.jobs.melon.status, 'selected');
+});
+
+test('오픈 갱신 도중 중지하면 추가 갱신과 클릭을 하지 않는다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ runner, fixtures }) => {
+    fixtures.melon.state.missing.add('#date');
+    fixtures.melon.state.onGoto = loads => { if (loads === 2) runner.stop(); };
+  });
+  await runner.task;
+  assert.equal(runner.state.status, 'stopped');
+  assert.equal(fixtures.melon.state.loads, 2);
+  assert.deepEqual(fixtures.melon.state.clicks, []);
+});
+
+for (const [signal, blockedBy] of [['queueVisible', 'waiting-room'], ['blocked', 'security'], ['accessRestricted', 'restricted'], ['passwordVisible', 'login']]) {
+  test(`오픈 확인 중 ${signal} 감지 후 갱신하지 않는다`, async () => {
+    const { runner, fixtures } = await prepareOpening(({ fixtures }) => {
+      fixtures.melon.state.missing.add('#date');
+      fixtures.melon.state.onGoto = loads => { if (loads === 2) fixtures.melon.state.signals = { [signal]: true }; };
+    });
+    await runner.task;
+    assert.equal(fixtures.melon.state.loads, 2);
+    assert.equal(runner.state.jobs.melon.blockedBy, blockedBy);
+    assert.deepEqual(fixtures.melon.state.clicks, []);
+  });
+}
+
+test('예매 버튼 클릭 후 응답을 잃어도 재클릭하거나 갱신하지 않는다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ fixtures }) => {
+    fixtures.melon.state.onClick = selector => { if (selector === '#entry') throw new Error('response lost'); };
+  });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 1);
+  assert.equal(fixtures.melon.state.clicks.filter(s => s === '#entry').length, 1);
+  assert.equal(runner.state.status, 'waiting');
+});
+
+test('같은 탭이 다른 멜론 주소로 이동해도 공연 페이지로 되돌리지 않는다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ runner, fixtures }) => {
+    fixtures.melon.state.missing.add('#date');
+    const run = runner.runMelonOpening.bind(runner);
+    runner.runMelonOpening = (...args) => {
+      fixtures.melon.page.address = 'https://ticket.melon.com/reservation/';
+      return run(...args);
+    };
+  });
+  await runner.task;
+  assert.equal(fixtures.melon.state.loads, 1);
+  assert.equal(runner.state.status, 'waiting');
+  assert.match(runner.state.jobs.melon.message, /이동/);
+  assert.deepEqual(fixtures.melon.state.clicks, []);
+});
+
+test('시간 제한에 도달하면 남은 갱신 횟수가 있어도 재탐색을 종료한다', async () => {
+  const { runner, fixtures } = await prepareOpening(({ runner, fixtures }) => {
+    runner.openingWaitMs = 50;
+    runner.openingRefreshMs = 1000;
+    fixtures.melon.state.missing.add('#date');
+  });
+  await runner.task;
+  assert.ok(fixtures.melon.state.loads <= 2);
+  assert.equal(runner.state.status, 'waiting');
+  assert.match(runner.state.jobs.melon.message, /제한/);
 });
 
 test('공연 페이지 응답 오류를 클릭 시도 전에 알리고 같은 창에서 재개할 수 있다', async () => {

@@ -1,1 +1,1 @@
-export const API_REVISION = 'scheduled-prewarm-9';
+export const API_REVISION = 'melon-opening-10';

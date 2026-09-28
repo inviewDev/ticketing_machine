@@ -5,6 +5,7 @@ import { Runner } from '../../server/automation.mjs';
 import { melonSelectors, revealMelonDate } from '../../server/melon.mjs';
 import { defaultPreferences } from '../../shared/model.mjs';
 import { readLoginSignals } from '../../server/browser.mjs';
+import { readPerformanceSchedule } from '../../server/schedule.mjs';
 
 // Offline Chromium fixtures reproduce the public date/time DOM of product 213480.
 // Login and seat responses are fixtures; this suite does not prove live seat booking.
@@ -87,6 +88,15 @@ async function exercise(options, fn) {
   });
 }
 
+test('관람 시간 입력 전에도 멜론 날짜를 선택하여 실제 회차를 조회한다', async () => {
+  await withPage(markup({ delayed: true }), async page => {
+    const result = await readPerformanceSchedule({ page, id: 'melon', date: config().date, timeoutMs: 1000 });
+    assert.deepEqual(result.sessions.map(s => s.time), ['14:30', '19:30']);
+    assert.ok(result.sessions.every(s => s.casting === '테스트 배우'));
+    assert.deepEqual(await page.evaluate(() => window.clicks), ['list', 'date']);
+  });
+});
+
 test('실제 Chromium 클릭으로 목록→날짜→지연 회차→예매→DOM 좌석 선택을 진행한다', async () => {
   await exercise({ delayed: true }, async (runner, page, originalPage) => {
     assert.equal(runner.state.jobs.melon.status, 'selected');
@@ -144,3 +154,41 @@ test('숨겨진 보안문자 폼은 인증 대기로 오인하지 않으며 입�
     assert.equal(JSON.stringify(signals).includes('private-test-value'), false);
   });
 });
+
+for (const mode of ['reload', 'dynamic', 'queue']) {
+  test(`카운트다운에서 예약 오픈 전환: ${mode}`, { timeout: 15000 }, async () => {
+    const context = await browser.newContext();
+    let runner;
+    try {
+      const scheduledAt = new Date(Date.now() + 9 * 3600000 + 3000).toISOString().slice(0, 19);
+      const at = Date.parse(scheduledAt + '+09:00');
+      const requests = [];
+      const countdown = '<!doctype html><meta charset="utf-8"><p>11:00 티켓오픈! (남은시간)</p>';
+      await context.route('**/*', async route => {
+        requests.push(Date.now());
+        let html = countdown;
+        if (mode === 'reload' && requests.length >= 4) html = markup({ delayed: true });
+        if (mode === 'dynamic') html += `<script>setTimeout(() => { document.open(); document.write(${JSON.stringify(markup({ delayed: true })).replaceAll('<', '\\u003c')}); document.close(); }, Math.max(0, ${at} - Date.now()));</script>`;
+        if (mode === 'queue' && requests.length >= 2) html = '<div id="NetFunnel_Loading_Popup">접속 대기 중입니다. 대기 순번 123</div>';
+        await route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
+      });
+      const browsers = { sessions: new Map([['melon', { context }]]), check: async () => ({ status: 'verified' }) };
+      runner = new Runner(browsers, () => {}, { elementWaitMs: 250, pollMs: 20, afterClickMs: 0, openingProbeMs: 150, openingRefreshMs: 400, openingWaitMs: 5000 });
+      await runner.start({ ...config(), sessionMode: 'opening', scheduledAt });
+      await runner.task;
+      assert.ok(requests.slice(1).every(time => time >= at));
+      if (mode === 'queue') {
+        assert.equal(requests.length, 2);
+        assert.equal(runner.state.jobs.melon.blockedBy, 'waiting-room');
+      } else {
+        assert.equal(requests.length, mode === 'reload' ? 4 : 1);
+        assert.equal(runner.state.jobs.melon.status, 'selected');
+        assert.deepEqual(await runner.pages('melon')[0].evaluate(() => window.clicks), ['list', 'date', 'evening', 'entry', 'seat']);
+      }
+    } finally {
+      runner?.stop();
+      await runner?.task;
+      await context.close();
+    }
+  });
+}

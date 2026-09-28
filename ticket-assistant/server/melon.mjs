@@ -2,7 +2,7 @@
 // These selectors cover the date, performance time and booking entry only.
 export function melonSelectors(config) {
   const day = config.date.replaceAll('-', '');
-  const [hours, minutes] = config.time.split(':');
+  const [hours = '', minutes = ''] = (config.time || '').split(':');
   const hour = hours.startsWith('0') ? '0?' + Number(hours) : hours;
   const minute = minutes.startsWith('0') ? '0?' + Number(minutes) : minutes;
   const clock = `^\\s*(?:${hour}\\s*:\\s*${minutes}|${hour}\\s*시\\s*${minute}\\s*분)(?=\\s|선예매|매진|$)`;

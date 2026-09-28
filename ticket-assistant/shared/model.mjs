@@ -2,7 +2,7 @@ import { getProvider, allowedUrl } from './providers.mjs';
 import { matchingPreference, validateSeatPreferences, seatKey } from './seat-map.mjs';
 import { getVenue } from './venues.mjs';
 
-export const defaultPreferences = () => ({ selected: [], title: '', date: '', time: '', quantity: 1, adjacent: true, zones: '', rows: '', urls: {}, venues: {}, scheduledAt: '', profiles: {}, seatPreferences: {} });
+export const defaultPreferences = () => ({ selected: [], title: '', date: '', time: '', sessionMode: 'official', quantity: 1, adjacent: true, zones: '', rows: '', urls: {}, venues: {}, scheduledAt: '', profiles: {}, seatPreferences: {} });
 export const ACTIVE_RUN_STATES = ['validating', 'running', 'scheduled', 'waiting', 'stopping'];
 export const PHASE_LABELS = { date: '관람 날짜 선택', time: '회차 선택', entry: '예매하기', zone: '구역·좌석 선택' };
 const record = value => value && typeof value === 'object' && !Array.isArray(value);
@@ -14,6 +14,7 @@ export function validatePreferences(input, forRun = false, { preview = false } =
   const quantity = Number(input.quantity);
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 4) throw new Error('좌석 수는 1~4석으로 설정해주세요.');
   const result = { ...defaultPreferences(), selected, quantity, adjacent: input.adjacent !== false };
+  result.sessionMode = input.sessionMode === 'opening' ? 'opening' : 'official';
   for (const key of ['title', 'date', 'time', 'zones', 'rows', 'scheduledAt']) {
     result[key] = typeof input[key] === 'string' ? input[key].trim().slice(0, 300) : '';
   }
@@ -41,6 +42,11 @@ export function validatePreferences(input, forRun = false, { preview = false } =
   }
   result.seatPreferences = validateSeatPreferences(input.seatPreferences);
   if (forRun && (!selected.length || !result.date || !result.time)) throw new Error('티켓처, 관람 날짜, 회차를 설정해주세요.');
+  if (forRun && result.sessionMode === 'opening') {
+    if (selected.length !== 1 || selected[0] !== 'melon') throw new Error('오픈 전 회차 직접 입력은 멜론티켓 단일 선택에서 사용할 수 있습니다.');
+    if (!result.scheduledAt) throw new Error('오픈 전 준비에는 티켓 오픈 시각을 예약 실행에 입력해주세요.');
+    if (input.profiles?.melon?.order === 'entry-first') throw new Error('멜론 오픈 전 준비는 날짜 → 회차 → 예매하기 순서로 설정해주세요.');
+  }
   if (forRun && !preview) for (const id of selected) {
     const preference = matchingPreference(result, id);
     if (result.seatPreferences[id] && !preference) throw new Error(getProvider(id).name + ': 공연이나 회차가 바뀌었습니다. 해당 공연의 좌석도에서 선호 좌석을 다시 선택해주세요.');

@@ -46,13 +46,15 @@ export function readLoginSignals() {
     || /restricted\s+access\s+to\s+service/i.test(bodyText) && /policy\s+violations|code:\s*12/i.test(bodyText);
   const netFunnelInvalid = /facility\.ticketlink\.co\.kr\/error\/popup\/none/i.test(address) && /error\.netfunnel\.invalid\.key/i.test(address)
     || /비정상적인\s*접근으로\s*이용이\s*일시\s*제한/.test(bodyText) && /정상적인\s*방법으로\s*예매/.test(bodyText);
+  const queueVisible = [...document.querySelectorAll('[id*="netfunnel" i],[id*="waiting" i],[class*="queue" i],[role="dialog"]')]
+    .some(el => visible(el) && /접속\s*대기|대기\s*(순서|순번|인원)|예상\s*대기\s*시간/.test(el.innerText || ''));
   const logoutVisible = names.some(name => /^(로그아웃|logout|signout)$/.test(name)) || controls.some(el => /logout|logoff/i.test(el.getAttribute('href') || '') && !/로그인/.test(el.textContent || ''));
   const loginVisible = names.some(name => /^(로그인|login|signin|로그인하기|회원로그인|로그인또는회원가입하기|카카오계정로그인|카카오qr코드로그인|멜론아이디로그인)$/.test(name));
-  return { passwordVisible, blocked, accessRestricted, netFunnelInvalid, logoutVisible, loginVisible };
+  return { passwordVisible, blocked, accessRestricted, netFunnelInvalid, queueVisible, logoutVisible, loginVisible };
 }
 
 export async function inspectLoginPage(page, provider) {
-  const signals = { trusted: false, logoutVisible: false, loginVisible: false, passwordVisible: false, blocked: false, accessRestricted: false, netFunnelInvalid: false };
+  const signals = { trusted: false, logoutVisible: false, loginVisible: false, passwordVisible: false, blocked: false, accessRestricted: false, netFunnelInvalid: false, queueVisible: false };
   const pageUrl = page.url();
   if (/^https:\/\/cdn-botmanager\.stclab\.com\//.test(page.url())) {
     try {
@@ -75,6 +77,7 @@ export async function inspectLoginPage(page, provider) {
       signals.blocked ||= observed.blocked;
       signals.accessRestricted ||= observed.accessRestricted;
       signals.netFunnelInvalid ||= observed.netFunnelInvalid;
+      signals.queueVisible ||= observed.queueVisible;
       signals.loginVisible ||= observed.loginVisible;
     } catch { /* A navigating frame cannot supply login evidence. */ }
   }

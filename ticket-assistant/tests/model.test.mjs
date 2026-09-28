@@ -48,6 +48,14 @@ test('선택을 해제한 티켓처의 URL도 저장하고 날짜가 넘어가�
   assert.equal(validatePreferences({ ...defaultPreferences(), scheduledAt: '2099-10-17T19:00' }).scheduledAt, '2099-10-17T19:00');
 });
 const seat = (zone, row, number, extra = {}) => ({ zone, row, number, available: true, selected: false, ...extra });
+test('오픈 전 회차는 멜론 단일 선택과 미래 예약 실행이 필요하며 저장 후 유지된다', () => {
+  const input = { ...defaultPreferences(), selected: ['melon'], urls: { melon: 'https://ticket.melon.com/performance' }, date: '2099-10-17', time: '19:00', zones: 'A구역', sessionMode: 'opening', scheduledAt: '2099-09-22T11:00' };
+  assert.equal(validatePreferences(input, true).sessionMode, 'opening');
+  assert.equal(validatePreferences(JSON.parse(JSON.stringify(input))).sessionMode, 'opening');
+  assert.throws(() => validatePreferences({ ...input, scheduledAt: '' }, true), /오픈 시각/);
+  assert.throws(() => validatePreferences({ ...input, selected: ['melon', 'nol'], urls: { ...input.urls, nol: 'https://nol.yanolja.com/ticket' } }, true), /단일 선택/);
+  assert.throws(() => validatePreferences({ ...input, profiles: { melon: { order: 'entry-first' } } }, true), /날짜/);
+});
 test('구역 우선순위를 지키고 판매된 좌석과 다른 열을 제외한 연석을 선택한다', () => {
   const seats = [seat('B구역', '1', 1), seat('B구역', '1', 2), seat('A구역', '3', 1), seat('A구역', '3', 2, { available: false }), seat('A구역', '3', 3), seat('A구역', '3', 4), seat('A구역', '4', 5)];
   assert.deepEqual(chooseSeats(seats, { quantity: 2, adjacent: true, zones: 'A구역, B구역', rows: '' }).map(s => s.number), [3, 4]);

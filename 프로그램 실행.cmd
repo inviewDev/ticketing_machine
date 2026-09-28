@@ -4,7 +4,7 @@ title Ticketing Assistant
 cd /d "%~dp0ticket-assistant"
 
 rem Exit 0: current version, 2: older Ticketing Assistant, 1: not running.
-powershell.exe -NoProfile -NonInteractive -Command "try { $r = Invoke-RestMethod -Uri 'http://127.0.0.1:4318/api/health' -TimeoutSec 2; if ($r.ok -and $r.app -eq 'ticket-assistant' -and $r.revision -eq 'scheduled-prewarm-9') { exit 0 }; if ($r.ok -and $r.app -eq 'ticket-assistant') { exit 2 }; exit 1 } catch { exit 1 }" >nul 2>&1
+powershell.exe -NoProfile -NonInteractive -Command "try { $r = Invoke-RestMethod -Uri 'http://127.0.0.1:4318/api/health' -TimeoutSec 2; if ($r.ok -and $r.app -eq 'ticket-assistant' -and $r.revision -eq 'melon-opening-10') { exit 0 }; if ($r.ok -and $r.app -eq 'ticket-assistant') { exit 2 }; exit 1 } catch { exit 1 }" >nul 2>&1
 if errorlevel 2 goto outdated
 if errorlevel 1 goto launch
 

@@ -29,8 +29,8 @@ export function readSeatElements(elements) {
 }
 
 export class Runner {
-  constructor(browsers, emit = () => {}, { elementWaitMs = 6000, pollMs = 200, afterClickMs = 350, prepareAheadMs = 5 * 60 * 1000 } = {}) {
-    Object.assign(this, { browsers, emit, elementWaitMs, pollMs, afterClickMs, prepareAheadMs });
+  constructor(browsers, emit = () => {}, { elementWaitMs = 6000, pollMs = 200, afterClickMs = 350, prepareAheadMs = 5 * 60 * 1000, openingWaitMs = 60000, openingProbeMs = 300, openingRefreshMs = 2000, openingMaxRefreshes = 10 } = {}) {
+    Object.assign(this, { browsers, emit, elementWaitMs, pollMs, afterClickMs, prepareAheadMs, openingWaitMs, openingProbeMs, openingRefreshMs, openingMaxRefreshes });
     this.state = { status: 'idle', jobs: {}, winner: null, runId: 0 };
     this.stopped = false;
     this.generation = 0;
@@ -111,7 +111,7 @@ export class Runner {
       const prepareAt = Math.max(Date.now(), at - this.prepareAheadMs);
       while (Date.now() < prepareAt) { this.guard(generation); await wait(Math.min(250, prepareAt - Date.now())); }
       this.guard(generation);
-      await Promise.allSettled(config.selected.map(id => this.runProvider(id, config, generation, false, { stopBefore: 'entry' })));
+      await Promise.allSettled(config.selected.map(id => this.runProvider(id, config, generation, false, { stopBefore: 'entry', prepareUntil: at })));
       this.guard(generation);
       this.state.status = 'scheduled';
     }
@@ -121,10 +121,15 @@ export class Runner {
     await Promise.allSettled(config.selected.map(async id => {
       const context = this.contexts.get(id);
       const canResume = Boolean(context && this.pages(id).length);
+      if (scheduled && id === 'melon' && canResume && context.phases[0] === 'date') {
+        if (this.state.jobs[id]?.blockedBy) return;
+        return this.runMelonOpening(id, config, generation, at);
+      }
       if (scheduled && canResume && !context.prepared && !this.state.jobs[id]?.blockedBy) {
         const page = this.pages(id)[0];
         try {
           this.update(id, 'opening', '오픈 시각이 되어 공연 페이지를 한 번 갱신합니다.', { canResume: false, blockedBy: null });
+          context.index = 0;
           const response = await page.goto(config.urls[id], { waitUntil: 'domcontentloaded', timeout: 30000 });
           if (response && response.status() >= 400) throw new Error('공연 페이지가 HTTP ' + response.status() + ' 응답을 반환했습니다.');
         } catch (error) {
@@ -135,6 +140,50 @@ export class Runner {
       return this.runProvider(id, config, generation, canResume);
     }));
     this.finish();
+  }
+
+  async runMelonOpening(id, config, generation, at) {
+    const context = this.contexts.get(id);
+    const originalPage = context.productPage;
+    const deadline = at + this.openingWaitMs;
+    let refreshes = 0;
+    let lastRefresh = 0;
+    try {
+      while (Date.now() < deadline) {
+        this.guard(generation, id);
+        await this.checkBlockers(id, generation);
+        if (this.pages(id)[0] !== originalPage || originalPage.url() !== context.productUrl) throw new Error('예매 화면이 이동하여 오픈 재탐색을 멈췄습니다. 현재 화면을 확인해주세요.');
+        // First inspect the existing page: Melon may reveal the controls itself.
+        await this.runProvider(id, config, generation, true, { openingDeadline: deadline });
+        this.guard(generation, id);
+        if (!context.openingRetry || context.entryAttempted || this.state.jobs[id]?.blockedBy) return;
+        if (refreshes >= this.openingMaxRefreshes || Date.now() >= deadline) break;
+        const nextRefresh = lastRefresh + this.openingRefreshMs;
+        if (Date.now() < nextRefresh) {
+          await wait(Math.max(0, Math.min(this.pollMs, nextRefresh - Date.now(), deadline - Date.now())));
+          continue;
+        }
+        this.guard(generation, id);
+        if (Date.now() >= deadline) break;
+        await this.checkBlockers(id, generation);
+        if (this.pages(id)[0] !== originalPage || originalPage.url() !== context.productUrl || !allowedUrl(originalPage.url(), getProvider(id))) throw new Error('예매 화면이 이동하여 자동 갱신을 멈췄습니다. 현재 화면을 확인해주세요.');
+        // Reload clears both selections, even if only the time was missing.
+        context.index = 0;
+        context.prepared = false;
+        refreshes++;
+        lastRefresh = Date.now();
+        this.update(id, 'opening', `오픈 화면을 확인하고 있습니다. 공연 페이지 갱신 ${refreshes}/${this.openingMaxRefreshes}회`, { phase: 'date', canResume: false, refreshes });
+        const response = await originalPage.goto(config.urls[id], { waitUntil: 'domcontentloaded', timeout: Math.max(1, Math.min(10000, deadline - Date.now())) });
+        this.guard(generation, id);
+        if (response && response.status() >= 400) throw new Error('공연 페이지가 HTTP ' + response.status() + ' 응답을 반환했습니다. 자동 갱신을 멈췄습니다.');
+      }
+      throw new Error(`오픈 확인 제한에 도달했습니다. (${Math.round(this.openingWaitMs / 1000)}초 이내, 최대 ${this.openingMaxRefreshes}회 갱신) 날짜·회차와 공식 화면을 확인한 뒤 이어가세요.`);
+    } catch (error) {
+      this.update(id, this.stopped ? 'stopped' : 'waiting', error.message, {
+        canResume: !this.stopped && !this.state.winner, blockedBy: error.blockedBy || null,
+        phase: context.phases[context.index], resumeSteps: context.phases.slice(context.index), refreshes,
+      });
+    }
   }
 
   async resume(id, { runId, phase } = {}) {
@@ -184,14 +233,16 @@ export class Runner {
     const signals = await inspectLoginPage(page, provider);
     this.guard(generation, id);
     if (page.isClosed()) throw new Error('예매창이 닫혔습니다.');
+    if (signals.accessRestricted) throw manualStep('restricted', '티켓처의 접근 제한 화면입니다. 자동 진행을 멈췄습니다. 공식 화면을 확인해주세요.');
+    if (signals.queueVisible) throw manualStep('waiting-room', '공식 대기열에 진입했습니다. 새로고침 없이 기다린 뒤 현재 단계부터 이어가세요.');
     if (signals.netFunnelInvalid) throw manualStep('queue', 'TicketLINK 대기열 연결 키가 거부되었습니다. 오류 팝업을 닫고 샤롯데 공연 상세 페이지를 유지했습니다. 광고·추적 차단, VPN 또는 보안 DNS가 켜져 있다면 해제한 뒤 예매하기 단계부터 이어가세요.');
     if (signals.blocked) throw manualStep('security', '보안인증 대기 중입니다. 공식 예매창에서 보안문자를 입력하고 인증을 완료한 뒤, 인증 완료 후 이어가기를 눌러주세요.');
     if (signals.passwordVisible || (allowedUrl(page.url(), provider, true) && !allowedUrl(page.url(), provider))) throw manualStep('login', '로그인이 필요합니다. 공식 창에서 완료한 뒤 이어갈 단계를 선택해주세요.');
     if (!allowedBookingUrl(page.url(), provider)) throw new Error('공식 예매 화면으로 돌아온 뒤 이어갈 단계를 선택해주세요.');
   }
 
-  async clickOne(id, selectors, generation, optional = false, beforeSearch = null) {
-    const deadline = Date.now() + (optional ? Math.min(1000, this.elementWaitMs) : this.elementWaitMs);
+  async clickOne(id, selectors, generation, optional = false, beforeSearch = null, { until = Infinity, beforeClick = () => {} } = {}) {
+    const deadline = Math.min(until, Date.now() + (optional ? Math.min(1000, this.elementWaitMs) : this.elementWaitMs));
     do {
       this.guard(generation, id);
       await this.checkBlockers(id, generation);
@@ -212,6 +263,7 @@ export class Runner {
           const text = await matches[0].evaluate(el => [el.textContent, el.getAttribute('aria-label'), el.getAttribute('value')].filter(Boolean).join(' '));
           if (/결제|구매\s*확정|동의|약관|pay\s*now|checkout/i.test(text)) throw new Error('결제 또는 동의 단계입니다. 직접 진행해주세요.');
           this.guard(generation, id);
+          beforeClick();
           await matches[0].click({ timeout: 4000 });
           await wait(this.afterClickMs);
           this.guard(generation, id);
@@ -221,7 +273,7 @@ export class Runner {
       if (Date.now() >= deadline) break;
       await wait(this.pollMs);
     } while (true);
-    if (!optional) throw new Error('지정한 항목이 나타나지 않았습니다. 브라우저에서 직접 진행한 뒤 다음 단계부터 이어가세요.');
+    if (!optional) throw Object.assign(new Error('지정한 항목이 나타나지 않았습니다. 브라우저에서 직접 진행한 뒤 다음 단계부터 이어가세요.'), { code: 'TARGET_MISSING' });
     return false;
   }
 
@@ -341,12 +393,13 @@ export class Runner {
     throw new Error('조건에 맞는 좌석을 읽지 못했습니다. 좌석이 없거나 화면 연결이 필요합니다. 캔버스 좌석도는 직접 선택해주세요.');
   }
 
-  async runProvider(id, config, generation, resume = false, { stopBefore = '' } = {}) {
+  async runProvider(id, config, generation, resume = false, { stopBefore = '', prepareUntil = Infinity, openingDeadline = Infinity } = {}) {
     const session = this.browsers.sessions.get(id);
     const profile = config.profiles[id] || {};
     let context = this.contexts.get(id);
     try {
       this.guard(generation, id);
+      if (context) context.openingRetry = false;
       if (!session) throw new Error('티켓처 브라우저를 다시 연결해주세요.');
       if (!resume) {
         if ((await this.browsers.check(id, { fresh: true, maxAgeMs: 30000 }))?.status !== 'verified') throw new Error('로그인이 만료되었거나 확인되지 않습니다. 다시 로그인해주세요.');
@@ -363,6 +416,8 @@ export class Runner {
         this.contexts.set(id, context);
         const response = await page.goto(config.urls[id], { waitUntil: 'domcontentloaded', timeout: 30000 });
         if (response && response.status() >= 400) throw new Error('공연 페이지가 HTTP ' + response.status() + ' 응답을 반환했습니다. 공연 주소와 티켓처 접속 상태를 확인해주세요.');
+        context.productPage = page;
+        context.productUrl = page.url();
         if (allowedUrl(page.url(), getProvider(id))) {
           try { context.performance = await page.evaluate(readPerformanceInfo); } catch { /* Public metadata is optional. */ }
         }
@@ -396,7 +451,14 @@ export class Runner {
                 ? async () => revealNolDate(await this.visibleFrames(id), config, () => this.guard(generation, id))
                 : null
             : null;
-          await this.clickOne(id, selectors[phase], generation, false, beforeDate);
+          const until = Math.min(prepareUntil, openingDeadline, Number.isFinite(openingDeadline) ? Date.now() + this.openingProbeMs : Infinity);
+          await this.clickOne(id, selectors[phase], generation, false, beforeDate, {
+            until,
+            beforeClick: () => {
+              if (Date.now() >= Math.min(prepareUntil, openingDeadline)) throw Object.assign(new Error('오픈 대기 단계로 전환합니다.'), { code: 'TARGET_MISSING' });
+              if (phase === 'entry') context.entryAttempted = true;
+            },
+          });
         }
       }
     } catch (error) {
@@ -406,6 +468,17 @@ export class Runner {
       if (canResume && !error.blockedBy) {
         try { await this.checkBlockers(id, generation); }
         catch (blocker) { if (blocker.blockedBy) error = blocker; }
+      }
+      if (canResume && error.code === 'TARGET_MISSING' && !error.blockedBy && !context.entryAttempted && id === 'melon' && context.phases[0] === 'date') {
+        if (stopBefore) {
+          this.update(id, 'waiting_open', '아직 날짜·회차를 선택할 수 없습니다. 예약 시각에 오픈 화면을 다시 확인합니다.', { phase: context.phases[context.index], canResume: false, blockedBy: null, targetAt: prepareUntil });
+          return;
+        }
+        if (Number.isFinite(openingDeadline)) {
+          context.openingRetry = true;
+          this.update(id, 'opening', '설정한 날짜·회차와 예매 버튼이 열리는지 확인 중입니다.', { phase: context.phases[context.index], canResume: false, blockedBy: null });
+          return;
+        }
       }
       // Login can return to the product page after the booking-entry click.
       // Keep that step available so the user can reopen booking in the same tab.
